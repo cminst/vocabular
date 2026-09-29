@@ -1,7 +1,19 @@
 """Train a 32k BPE tokenizer on 10GB of FineWeb text with Modal.
 
-Plan: modal run scripts/modal_fineweb_32k.py
-Run:  modal run scripts/modal_fineweb_32k.py --submit
+From the repository root, install with `uv pip install -r requirements.txt`.
+Select the intended Modal profile according to the Notion Modal runbook.
+
+Plan: python -m modal run scripts/modal_fineweb_32k.py
+Run:  python -m modal run scripts/modal_fineweb_32k.py --submit
+
+Streams HuggingFaceFW/fineweb, config sample-10BT, in dataset order. The
+training cap is 10,000,000,000 UTF-8 text bytes. The function requests 32 CPUs,
+16 GiB of memory, and a 24-hour timeout. It writes tokenizer.json and run.json
+to the vocabular-tokenizers volume at /fineweb-10gb-32k/ and commits the volume.
+An existing run directory is never overwritten.
+
+Download after completion:
+    python -m modal volume get vocabular-tokenizers /fineweb-10gb-32k outputs
 """
 
 from pathlib import Path
