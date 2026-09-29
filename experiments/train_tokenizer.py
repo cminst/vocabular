@@ -31,7 +31,11 @@ class CorpusStats:
 
 
 def limited_text(
-    rows: Iterable[dict], column: str, max_bytes: int, stats: CorpusStats
+    rows: Iterable[dict],
+    column: str,
+    max_bytes: int,
+    stats: CorpusStats,
+    progress_label: str = "Streamed",
 ) -> Iterator[str]:
     next_progress = PROGRESS_BYTES
     for row in rows:
@@ -58,7 +62,7 @@ def limited_text(
         if stats.bytes_used >= next_progress:
             percent = 100 * stats.bytes_used / max_bytes
             print(
-                f"Streamed {stats.bytes_used:,} / {max_bytes:,} UTF-8 bytes "
+                f"{progress_label} {stats.bytes_used:,} / {max_bytes:,} UTF-8 bytes "
                 f"({percent:.1f}%; {stats.documents_used:,} documents)",
                 flush=True,
             )
