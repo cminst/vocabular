@@ -25,7 +25,7 @@ image = (
 )
 
 
-@app.function(image=image, volumes={"/results": volume}, cpu=4, memory=16_384, timeout=86_400)
+@app.function(image=image, volumes={"/results": volume}, cpu=32, memory=16_384, timeout=86_400)
 def train() -> None:
     from experiments.train_tokenizer import train_tokenizer
 
