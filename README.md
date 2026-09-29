@@ -1,5 +1,5 @@
 <p align="center">
-  <img height="120" src="./vocabular.svg" alt="vocabular Logo" />
+  <img height="60" src="./vocabular.svg" alt="vocabular Logo" />
 </p>
 
 ---
