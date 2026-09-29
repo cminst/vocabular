@@ -6,6 +6,7 @@ from itertools import chain
 import json
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Iterable, Iterator
 
 from datasets import load_dataset
@@ -97,6 +98,7 @@ def train_tokenizer(
         if any(output_dir.iterdir()):
             raise ValueError(f"output directory is not empty: {output_dir}")
 
+    run_started = perf_counter()
     print(
         f"Opening streamed dataset: {dataset_id} "
         f"({config or 'default'}, {split}/{text_column})",
@@ -123,10 +125,14 @@ def train_tokenizer(
         special_tokens=["[UNK]"],
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
+    training_started = perf_counter()
     tokenizer.train_from_iterator(chain((first,), corpus), trainer=trainer)
+    training_seconds = perf_counter() - training_started
+    total_seconds = perf_counter() - run_started
     print(
         f"Finished stream: {stats.bytes_used:,} UTF-8 bytes "
-        f"from {stats.documents_used:,} documents",
+        f"from {stats.documents_used:,} documents "
+        f"(training {training_seconds:.1f}s; total {total_seconds:.1f}s)",
         flush=True,
     )
 
@@ -142,6 +148,8 @@ def train_tokenizer(
         "documents_used": stats.documents_used,
         "vocab_size_requested": vocab_size,
         "vocab_size_actual": tokenizer.get_vocab_size(),
+        "training_seconds": training_seconds,
+        "total_seconds": total_seconds,
     }
     (output_dir / "run.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
