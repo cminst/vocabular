@@ -13,6 +13,7 @@ from tokenizers import Tokenizer, decoders, models, pre_tokenizers, trainers
 
 
 SIZE_UNITS = {"B": 1, "KB": 1_000, "MB": 1_000_000, "GB": 1_000_000_000}
+PROGRESS_BYTES = 500_000_000
 
 
 def parse_size(value: str) -> int:
@@ -31,6 +32,7 @@ class CorpusStats:
 def limited_text(
     rows: Iterable[dict], column: str, max_bytes: int, stats: CorpusStats
 ) -> Iterator[str]:
+    next_progress = PROGRESS_BYTES
     for row in rows:
         if column not in row:
             raise ValueError(f"Text column {column!r} is missing; available: {', '.join(row)}")
@@ -52,6 +54,15 @@ def limited_text(
         if text:
             stats.bytes_used += len(encoded)
             stats.documents_used += 1
+        if stats.bytes_used >= next_progress:
+            percent = 100 * stats.bytes_used / max_bytes
+            print(
+                f"Streamed {stats.bytes_used:,} / {max_bytes:,} UTF-8 bytes "
+                f"({percent:.1f}%; {stats.documents_used:,} documents)",
+                flush=True,
+            )
+            next_progress = ((stats.bytes_used // PROGRESS_BYTES) + 1) * PROGRESS_BYTES
+        if text:
             yield text
         if stats.bytes_used >= max_bytes or truncated:
             return
@@ -86,12 +97,23 @@ def train_tokenizer(
         if any(output_dir.iterdir()):
             raise ValueError(f"output directory is not empty: {output_dir}")
 
+    print(
+        f"Opening streamed dataset: {dataset_id} "
+        f"({config or 'default'}, {split}/{text_column})",
+        flush=True,
+    )
     dataset = load_dataset(dataset_id, name=config, split=split, streaming=True)
+    print(f"Streaming up to {size:,} UTF-8 bytes", flush=True)
     stats = CorpusStats()
     corpus = limited_text(dataset, text_column, size, stats)
     first = next(corpus, None)
     if first is None:
         raise ValueError("dataset yielded no nonempty text within the size limit")
+    print(
+        f"Received first document ({len(first.encode('utf-8')):,} UTF-8 bytes); "
+        "training BPE while the stream is consumed",
+        flush=True,
+    )
 
     tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
     tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
@@ -102,6 +124,11 @@ def train_tokenizer(
         initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
     )
     tokenizer.train_from_iterator(chain((first,), corpus), trainer=trainer)
+    print(
+        f"Finished stream: {stats.bytes_used:,} UTF-8 bytes "
+        f"from {stats.documents_used:,} documents",
+        flush=True,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     tokenizer.save(str(output_dir / "tokenizer.json"))

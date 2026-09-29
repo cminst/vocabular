@@ -8,14 +8,16 @@ remote training.
 
 Streams HuggingFaceFW/fineweb, config sample-10BT, in dataset order. The
 training cap is 10,000,000,000 UTF-8 text bytes. The function requests 32 CPUs,
-16 GiB of memory, and a 24-hour timeout. It writes tokenizer.json and run.json
-to the vocabular-tokenizers volume at /fineweb-10gb-32k/ and commits the volume.
-An existing run directory is never overwritten.
+16 GiB of memory, and a 24-hour timeout. The local HF_TOKEN is passed to the
+remote function as a secret. It writes tokenizer.json and run.json to the
+vocabular-tokenizers volume at /fineweb-10gb-32k/ and commits the volume. An
+existing run directory is never overwritten.
 
 Download after completion:
     python -m modal volume get vocabular-tokenizers /fineweb-10gb-32k outputs
 """
 
+import os
 from pathlib import Path
 
 import modal
@@ -30,6 +32,7 @@ OUTPUT_DIR = Path("/results/fineweb-10gb-32k")
 
 app = modal.App("vocabular-fineweb-32k")
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
+hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.getenv("HF_TOKEN")})
 image = (
     modal.Image.debian_slim(python_version="3.12")
     .uv_pip_install("datasets>=3.0", "tokenizers>=0.20")
@@ -37,7 +40,14 @@ image = (
 )
 
 
-@app.function(image=image, volumes={"/results": volume}, cpu=32, memory=16_384, timeout=86_400)
+@app.function(
+    image=image,
+    volumes={"/results": volume},
+    secrets=[hf_secret],
+    cpu=32,
+    memory=16_384,
+    timeout=86_400,
+)
 def train() -> None:
     from experiments.train_tokenizer import train_tokenizer
 
@@ -61,4 +71,6 @@ def main(submit: bool = False) -> None:
     print(f"Vocabulary size: {VOCAB_SIZE:,}")
     print(f"Output: {VOLUME_NAME}:{OUTPUT_DIR}")
     if submit:
+        if not os.getenv("HF_TOKEN"):
+            raise RuntimeError("HF_TOKEN must be set locally before submitting")
         train.remote()
