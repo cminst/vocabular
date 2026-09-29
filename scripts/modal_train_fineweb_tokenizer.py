@@ -3,8 +3,8 @@
 From the repository root, install with `uv pip install -r requirements.txt`.
 Select the intended Modal profile according to the Notion Modal runbook.
 
-Plan: python -m modal run scripts/modal_fineweb_32k.py
-Run:  python -m modal run scripts/modal_fineweb_32k.py --submit
+Plan: python -m modal run scripts/modal_train_fineweb_tokenizer.py
+Run:  python -m modal run scripts/modal_train_fineweb_tokenizer.py --submit
 
 Streams HuggingFaceFW/fineweb, config sample-10BT, in dataset order. The
 training cap is 10,000,000,000 UTF-8 text bytes. The function requests 32 CPUs,
