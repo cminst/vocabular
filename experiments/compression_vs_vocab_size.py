@@ -3,10 +3,8 @@
 import json
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator
 
 from datasets import load_dataset
-from tokenizers import Tokenizer
 
 from experiments.tokenizer_eval_fineweb import (
     DEFAULT_CONFIG,
@@ -17,8 +15,8 @@ from experiments.tokenizer_eval_fineweb import (
 from experiments.train_tokenizer import CorpusStats, limited_text
 
 
-BATCH_BYTES = 16_000_000
 MAX_UTF8_BOUNDARY_SHORTFALL = 3
+CACHE_FORMAT = "jsonl-text-v1"
 
 
 def prepare_heldout_text(
@@ -34,8 +32,11 @@ def prepare_heldout_text(
     metadata_path = output_dir / "heldout_meta.json"
     temporary_path = output_dir / "heldout.jsonl.part"
     if text_path.exists() and metadata_path.exists():
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        if metadata.get("format") != CACHE_FORMAT:
+            metadata = migrate_heldout_text(text_path, metadata_path, metadata)
         print(f"Using cached held-out text: {text_path}", flush=True)
-        return json.loads(metadata_path.read_text(encoding="utf-8"))
+        return metadata
     if text_path.exists() or metadata_path.exists() or temporary_path.exists():
         raise ValueError(f"incomplete held-out text cache in {output_dir}")
     if skip_bytes < 0 or eval_bytes < 1:
@@ -64,12 +65,13 @@ def prepare_heldout_text(
         for text in limited_text(
             dataset, text_column, eval_bytes, cached, progress_label="Cached"
         ):
-            handle.write(json.dumps(text, ensure_ascii=False) + "\n")
+            handle.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
     if cached.bytes_used < eval_bytes - MAX_UTF8_BOUNDARY_SHORTFALL:
         raise ValueError("dataset ended before the requested evaluation size")
     temporary_path.replace(text_path)
 
     metadata = {
+        "format": CACHE_FORMAT,
         "dataset": dataset_id,
         "config": config,
         "split": split,
@@ -88,7 +90,26 @@ def prepare_heldout_text(
     return metadata
 
 
-def load_prefix_tokenizer(source_path: Path, vocab_size: int) -> Tokenizer:
+def migrate_heldout_text(text_path: Path, metadata_path: Path, metadata: dict) -> dict:
+    temporary_path = text_path.with_suffix(".jsonl.migrating")
+    if temporary_path.exists():
+        raise ValueError(f"incomplete held-out text migration: {temporary_path}")
+    print(f"Migrating held-out text cache to {CACHE_FORMAT}", flush=True)
+    with text_path.open(encoding="utf-8") as source, temporary_path.open(
+        "w", encoding="utf-8"
+    ) as destination:
+        for line in source:
+            text = json.loads(line)
+            if not isinstance(text, str):
+                raise ValueError(f"legacy held-out text must contain JSON strings: {text_path}")
+            destination.write(json.dumps({"text": text}, ensure_ascii=False) + "\n")
+    temporary_path.replace(text_path)
+    metadata["format"] = CACHE_FORMAT
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+    return metadata
+
+
+def prefix_tokenizer_json(source_path: Path, vocab_size: int) -> str:
     source = json.loads(source_path.read_text(encoding="utf-8"))
     model = source.get("model", {})
     if model.get("type") != "BPE":
@@ -104,8 +125,7 @@ def load_prefix_tokenizer(source_path: Path, vocab_size: int) -> Tokenizer:
         raise ValueError(
             f"vocab size must be between {base_vocab_size:,} and {full_vocab_size:,}"
         )
-    ids = set(vocab.values())
-    if ids != set(range(full_vocab_size)):
+    if set(vocab.values()) != set(range(full_vocab_size)):
         raise ValueError("BPE vocabulary IDs must be contiguous from zero")
 
     merge_count = vocab_size - base_vocab_size
@@ -113,10 +133,7 @@ def load_prefix_tokenizer(source_path: Path, vocab_size: int) -> Tokenizer:
         token: token_id for token, token_id in vocab.items() if token_id < vocab_size
     }
     source["model"]["merges"] = merges[:merge_count]
-    tokenizer = Tokenizer.from_str(json.dumps(source))
-    if tokenizer.get_vocab_size() != vocab_size:
-        raise ValueError(f"failed to construct the {vocab_size:,}-entry BPE prefix")
-    return tokenizer
+    return json.dumps(source)
 
 
 def vocabulary_sizes(source_path: Path, step: int) -> list[int]:
@@ -136,91 +153,79 @@ def vocabulary_sizes(source_path: Path, step: int) -> list[int]:
     return sizes
 
 
-def iter_cached_text(path: Path) -> Iterator[str]:
-    with path.open(encoding="utf-8") as handle:
-        for line in handle:
-            text = json.loads(line)
-            if not isinstance(text, str):
-                raise ValueError(f"cached text must contain JSON strings: {path}")
-            yield text
-
-
-def count_tokens(tokenizer: Tokenizer, text_path: Path) -> tuple[int, int, int]:
-    token_count = 0
-    text_bytes = 0
-    document_count = 0
-    batch: list[str] = []
-    batch_bytes = 0
-
-    def score_batch() -> int:
-        return sum(len(encoding.ids) for encoding in tokenizer.encode_batch(batch))
-
-    for text in iter_cached_text(text_path):
-        encoded_size = len(text.encode("utf-8"))
-        batch.append(text)
-        batch_bytes += encoded_size
-        text_bytes += encoded_size
-        document_count += 1
-        if batch_bytes >= BATCH_BYTES:
-            token_count += score_batch()
-            batch.clear()
-            batch_bytes = 0
-    if batch:
-        token_count += score_batch()
-    return token_count, text_bytes, document_count
-
-
-def measure_compression(
-    source_path: Path,
-    heldout_dir: Path,
-    output_path: Path,
-    vocab_step: int = 16_000,
-) -> dict:
+def measure_prefix(source_path: Path, heldout_dir: Path, vocab_size: int) -> dict:
     text_path = heldout_dir / "heldout.jsonl"
     metadata_path = heldout_dir / "heldout_meta.json"
     if not text_path.is_file() or not metadata_path.is_file():
         raise ValueError(f"held-out text cache is missing from {heldout_dir}")
-    if output_path.exists():
-        raise ValueError(f"output already exists: {output_path}")
     if not source_path.is_file():
         raise ValueError(f"source tokenizer was not found: {source_path}")
 
-    cache_metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-    sizes = vocabulary_sizes(source_path, vocab_step)
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if metadata.get("format") != CACHE_FORMAT:
+        raise ValueError("held-out text cache must be prepared before measurement")
+    started = perf_counter()
+    import awkward as ak
+    import gigatoken as gt
+
+    tokenizer = gt.Tokenizer.from_json(prefix_tokenizer_json(source_path, vocab_size))
+    tokens = tokenizer.encode_files(gt.JsonlFileSource([text_path], field="text"))
+    token_count = int(ak.sum(ak.num(tokens, axis=1)))
+    if token_count == 0:
+        raise ValueError(f"the {vocab_size:,}-entry BPE prefix produced no tokens")
+    text_bytes = metadata["cached_utf8_bytes"]
+    point = {
+        "vocab_size": vocab_size,
+        "token_count": token_count,
+        "bytes_per_token": text_bytes / token_count,
+        "tokens_per_byte": token_count / text_bytes,
+        "seconds": perf_counter() - started,
+    }
     print(
-        f"Measuring {len(sizes)} BPE prefixes from {sizes[0]:,} to {sizes[-1]:,} entries",
+        f"Vocab {vocab_size:,}: {point['bytes_per_token']:.4f} bytes/token "
+        f"({point['seconds']:.1f}s)",
         flush=True,
     )
-    started = perf_counter()
-    points = []
-    for vocab_size in sizes:
-        tokenizer = load_prefix_tokenizer(source_path, vocab_size)
-        point_started = perf_counter()
-        token_count, text_bytes, document_count = count_tokens(tokenizer, text_path)
-        elapsed = perf_counter() - point_started
-        if token_count == 0:
-            raise ValueError(f"the {vocab_size:,}-entry BPE prefix produced no tokens")
-        point = {
-            "vocab_size": vocab_size,
-            "token_count": token_count,
-            "bytes_per_token": text_bytes / token_count,
-            "tokens_per_byte": token_count / text_bytes,
-            "seconds": elapsed,
-        }
-        points.append(point)
-        print(
-            f"Vocab {vocab_size:,}: {point['bytes_per_token']:.4f} bytes/token "
-            f"({elapsed:.1f}s)",
-            flush=True,
-        )
+    return point
 
+
+def write_compression(
+    source_path: Path,
+    heldout_dir: Path,
+    output_path: Path,
+    vocab_step: int,
+    points: list[dict],
+) -> dict:
+    if output_path.exists():
+        raise ValueError(f"output already exists: {output_path}")
+    if not points:
+        raise ValueError("compression measurement produced no points")
+    metadata = json.loads((heldout_dir / "heldout_meta.json").read_text(encoding="utf-8"))
+    points.sort(key=lambda point: point["vocab_size"])
+    parity = None
+    prior_results_path = heldout_dir / "results.json"
+    if prior_results_path.is_file():
+        prior_results = json.loads(prior_results_path.read_text(encoding="utf-8"))
+        expected_count = prior_results.get("tokenizers", {}).get("32k", {}).get("token_count")
+        measured_count = next(
+            (point["token_count"] for point in points if point["vocab_size"] == 32_000),
+            None,
+        )
+        if expected_count is not None and measured_count is not None:
+            if measured_count != expected_count:
+                raise ValueError(
+                    "GigaToken disagrees with the existing 32k evaluation: "
+                    f"{measured_count:,} != {expected_count:,} tokens"
+                )
+            parity = {"vocab_size": 32_000, "token_count": measured_count}
     summary = {
         "source_tokenizer": str(source_path),
-        "heldout_cache": cache_metadata,
+        "heldout_cache": metadata,
         "vocab_step": vocab_step,
-        "evaluated_utf8_bytes": text_bytes,
-        "evaluated_documents": document_count,
-        "total_seconds": perf_counter() - started,
+        "evaluated_utf8_bytes": metadata["cached_utf8_bytes"],
+        "evaluated_documents": metadata["cached_documents"],
+        "worker_seconds": sum(point["seconds"] for point in points),
+        "gigatoken_parity": parity,
         "points": points,
     }
     output_path.parent.mkdir(parents=True, exist_ok=True)

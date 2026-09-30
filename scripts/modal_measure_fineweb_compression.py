@@ -10,8 +10,9 @@ document-preserving JSONL, so every BPE prefix is evaluated on identical text.
 
 The defaults skip the first 10GB of FineWeb, cache the next 1GB in the
 vocabular-tokenizers volume, and measure every 16,000 vocabulary entries from
-the 1M BPE tokenizer. This launcher writes JSON measurements only; use the
-local plotting script after downloading the results.
+the 1M BPE tokenizer. Each prefix is queued as a separate Modal call and uses
+GigaToken's direct JSONL reader. This launcher writes JSON measurements only;
+use the local plotting script after downloading the results.
 """
 
 import os
@@ -32,7 +33,7 @@ volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 hf_secret = modal.Secret.from_dict({"HF_TOKEN": os.getenv("HF_TOKEN")})
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .uv_pip_install("datasets>=3.0", "tokenizers>=0.20")
+    .uv_pip_install("datasets>=3.0", "gigatoken>=0.10", "tokenizers>=0.20")
     .add_local_python_source("experiments")
 )
 
@@ -62,18 +63,43 @@ def prepare(output_dir: str, skip_bytes: int, eval_bytes: int) -> None:
 @app.function(
     image=image,
     volumes={"/results": volume},
-    cpu=32,
-    memory=16_384,
+    cpu=1,
+    memory=1_024,
     timeout=86_400,
 )
-def measure(output_dir: str, vocab_step: int) -> None:
-    from experiments.compression_vs_vocab_size import measure_compression
+def measurement_plan(vocab_step: int) -> list[int]:
+    from experiments.compression_vs_vocab_size import vocabulary_sizes
 
-    measure_compression(
+    return vocabulary_sizes(SOURCE_TOKENIZER, vocab_step)
+
+
+@app.function(
+    image=image,
+    volumes={"/results": volume},
+    cpu=4,
+    memory=8_192,
+    timeout=86_400,
+)
+def measure_prefix(output_dir: str, vocab_size: int) -> dict:
+    from experiments.compression_vs_vocab_size import measure_prefix as run_prefix
+
+    return run_prefix(
+        source_path=SOURCE_TOKENIZER,
+        heldout_dir=Path(output_dir),
+        vocab_size=vocab_size,
+    )
+
+
+@app.function(image=image, volumes={"/results": volume}, timeout=86_400)
+def write_results(output_dir: str, vocab_step: int, points: list[dict]) -> None:
+    from experiments.compression_vs_vocab_size import write_compression
+
+    write_compression(
         source_path=SOURCE_TOKENIZER,
         heldout_dir=Path(output_dir),
         output_path=Path(output_dir) / "compression.json",
         vocab_step=vocab_step,
+        points=points,
     )
     volume.commit()
     print(f"Committed measurements to {VOLUME_NAME}:{output_dir}", flush=True)
@@ -107,4 +133,8 @@ def main(
         if stage in {"prepare", "all"}:
             prepare.remote(output_dir, skip_bytes, eval_bytes)
         if stage in {"measure", "all"}:
-            measure.remote(output_dir, vocab_step)
+            sizes = measurement_plan.remote(vocab_step)
+            print(f"Queueing {len(sizes)} BPE prefix measurements")
+            calls = [measure_prefix.spawn(output_dir, vocab_size) for vocab_size in sizes]
+            points = [call.get() for call in calls]
+            write_results.remote(output_dir, vocab_step, points)
