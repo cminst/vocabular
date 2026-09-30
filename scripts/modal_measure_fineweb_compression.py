@@ -91,13 +91,15 @@ def measure_prefix(output_dir: str, vocab_size: int) -> dict:
 
 
 @app.function(image=image, volumes={"/results": volume}, timeout=86_400)
-def write_results(output_dir: str, vocab_step: int, points: list[dict]) -> None:
+def write_results(
+    output_dir: str, result_name: str, vocab_step: int, points: list[dict]
+) -> None:
     from experiments.compression_vs_vocab_size import write_compression
 
     write_compression(
         source_path=SOURCE_TOKENIZER,
         heldout_dir=Path(output_dir),
-        output_path=Path(output_dir) / "compression.json",
+        output_path=Path(output_dir) / result_name,
         vocab_step=vocab_step,
         points=points,
     )
@@ -112,12 +114,15 @@ def main(
     skip: str = "10GB",
     vocab_step: int = 16_000,
     label: str = "fineweb-10gb-skip-1gb",
+    result_name: str = "compression.json",
     submit: bool = False,
 ) -> None:
     if stage not in {"prepare", "measure", "all"}:
         raise ValueError("stage must be prepare, measure, or all")
     if vocab_step < 1:
         raise ValueError("vocab step must be positive")
+    if Path(result_name).name != result_name or not result_name.endswith(".json"):
+        raise ValueError("result name must be a JSON filename")
     eval_bytes = parse_size(size)
     skip_bytes = parse_size(skip)
     output_dir = f"/results/evals/{label}"
@@ -127,6 +132,7 @@ def main(
     print(f"Source tokenizer: {VOLUME_NAME}:{SOURCE_TOKENIZER}")
     print(f"Vocabulary step: {vocab_step:,}")
     print(f"Output: {VOLUME_NAME}:{output_dir}")
+    print(f"Measurements: {result_name}")
     if submit:
         if stage in {"prepare", "all"} and not os.getenv("HF_TOKEN"):
             raise RuntimeError("HF_TOKEN must be set locally before preparing")
@@ -137,4 +143,4 @@ def main(
             print(f"Queueing {len(sizes)} BPE prefix measurements")
             calls = [measure_prefix.spawn(output_dir, vocab_size) for vocab_size in sizes]
             points = [call.get() for call in calls]
-            write_results.remote(output_dir, vocab_step, points)
+            write_results.remote(output_dir, result_name, vocab_step, points)
