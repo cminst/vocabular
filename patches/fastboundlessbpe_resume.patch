@@ -1,0 +1,209 @@
+diff --git a/src/lib.rs b/src/lib.rs
+index 4a648c0..896cf16 100644
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -329,7 +329,7 @@ impl PySuperBpeTrainer {
+         Ok(Self { inner })
+     }
+ 
+-    #[pyo3(signature = (filepath, outprefix, num_lines, vocab_size, recalc, word_model_file, max_bytes = 1000000000, checkpoint_iterations = 8192, verbose = true, progress_interval = None, save_pretokens = None, greedy_split = false, min_count = 15, max_ngram_len = 30))]
++    #[pyo3(signature = (filepath, outprefix, num_lines, vocab_size, recalc, word_model_file, max_bytes = 1000000000, checkpoint_iterations = 8192, verbose = true, progress_interval = None, save_pretokens = None, greedy_split = false, min_count = 15, max_ngram_len = 30, resume_model_file = None))]
+     fn train(
+         &mut self,
+         filepath: &str,
+@@ -346,6 +346,7 @@ impl PySuperBpeTrainer {
+         greedy_split: bool,
+         min_count: i64,
+         max_ngram_len: usize,
++        resume_model_file: Option<&str>,
+     ) -> PyResult<()> {
+         let progress_interval = resolve_progress_interval(progress_interval, verbose);
+         self.inner
+@@ -364,6 +365,7 @@ impl PySuperBpeTrainer {
+                 greedy_split,
+                 min_count,
+                 max_ngram_len,
++                resume_model_file,
+             )
+             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))
+     }
+diff --git a/src/tokenizer.rs b/src/tokenizer.rs
+index 141baa6..45a116b 100644
+--- a/src/tokenizer.rs
++++ b/src/tokenizer.rs
+@@ -319,7 +319,7 @@ impl Tokenizer {
+     }
+ 
+     /// Apply supermerges to a list of tokens. No prev_ind tracking (no deletions).
+-    fn supermerge_tokens(&self, tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
++    pub(crate) fn supermerge_tokens(&self, tokens: &[Vec<u8>]) -> Vec<Vec<u8>> {
+         let superwords = self.superwords.as_ref().expect("superwords must be loaded");
+         let mut result = tokens.to_vec();
+ 
+diff --git a/src/trainer.rs b/src/trainer.rs
+index 547fb4d..7ada0e4 100644
+--- a/src/trainer.rs
++++ b/src/trainer.rs
+@@ -1843,6 +1843,7 @@ impl BaseBpeTrainer {
+         greedy_split: bool,
+         min_count: i64,
+         max_ngram_len: usize,
++        resume_model_file: Option<&str>,
+     ) -> TokenizerResult<()> {
+         let overall_start = Instant::now();
+ 
+@@ -1921,6 +1922,98 @@ impl BaseBpeTrainer {
+             (text_chunks_raw, text_counts_raw)
+         };
+ 
++        let mut i: usize = 0;
++        if let Some(path) = resume_model_file {
++            if !superbpe_mode {
++                return Err(TokenizerError::ModelError(
++                    "resuming BoundlessBPE is not supported".into(),
++                ));
++            }
++            let mut checkpoint = Tokenizer::new();
++            checkpoint.load(path)?;
++            let saved_vocab = checkpoint.vocab.as_ref().ok_or_else(|| {
++                TokenizerError::ModelError("resume model has no vocabulary".into())
++            })?;
++            let word_model = self.word_model.as_ref().expect("word model loaded");
++            let word_vocab = word_model.vocab.as_ref().expect("word vocabulary loaded");
++            let saved_words = checkpoint.words.as_ref().ok_or_else(|| {
++                TokenizerError::ModelError("resume model has no word operations".into())
++            })?;
++            let word_ops = word_model.words.as_ref().expect("word operations loaded");
++            let saved_super = checkpoint.superwords.as_ref().ok_or_else(|| {
++                TokenizerError::ModelError("resume model has no supermerges".into())
++            })?;
++            let saved_scripts = saved_super
++                .pretokenizer
++                .script_specific_scripts
++                .as_ref()
++                .map(|scripts| scripts.iter().collect::<AHashSet<_>>());
++            let current_scripts = self
++                .inf_data
++                .pretokenizer
++                .script_specific_scripts
++                .as_ref()
++                .map(|scripts| scripts.iter().collect::<AHashSet<_>>());
++            let checks = [
++                (
++                    "superbpe mode",
++                    saved_super.is_super && saved_super.superbpe_mode,
++                ),
++                ("no deletions", saved_super.deletions.is_empty()),
++                (
++                    "word vocabulary",
++                    saved_vocab.tokens.starts_with(&word_vocab.tokens),
++                ),
++                ("word merges", saved_words.merges == word_ops.merges),
++                ("word deletions", saved_words.deletions == word_ops.deletions),
++                (
++                    "main regex",
++                    saved_super.pretokenizer.main_pattern_str
++                        == self.inf_data.pretokenizer.main_pattern_str,
++                ),
++                (
++                    "script regex",
++                    saved_super.pretokenizer.script_specific_pattern_str
++                        == self.inf_data.pretokenizer.script_specific_pattern_str,
++                ),
++                ("scripts", saved_scripts == current_scripts),
++                (
++                    "merge regex",
++                    saved_super.pretokenizer.merge_pattern_str
++                        == self.inf_data.pretokenizer.merge_pattern_str,
++                ),
++            ];
++            if let Some((name, _)) = checks.iter().find(|(_, passed)| !passed) {
++                return Err(TokenizerError::ModelError(format!(
++                    "resume model does not match this SuperBPE training run: {}",
++                    name
++                )));
++            }
++            i = saved_super.merges.len();
++            if i > vocab_size as usize
++                || saved_super
++                    .merges
++                    .keys()
++                    .any(|&idx| idx < 0 || idx as usize >= i)
++            {
++                return Err(TokenizerError::ModelError(
++                    "resume model has an invalid supermerge prefix".into(),
++                ));
++            }
++            println!("Resuming from {} completed supermerges in {}", i, path);
++            text_chunks = text_chunks
++                .into_par_iter()
++                .map(|tokens| checkpoint.supermerge_tokens(&tokens))
++                .collect();
++            self.vocab = Some(Vocabulary::create_from_vocab(saved_vocab));
++            self.inf_data = checkpoint.superwords.take().unwrap();
++            self.index_gen.next_index = i as i32;
++            self.unlocked.clear();
++            for token in &self.vocab.as_ref().unwrap().tokens {
++                self.unlocked.insert(token.clone(), true);
++            }
++        }
++
+         // Set up initial counts
+         let start_ic = Instant::now();
+         self.initial_counts(&text_chunks, &text_counts);
+@@ -1937,12 +2030,16 @@ impl BaseBpeTrainer {
+             println!("*\ti\tvocab\ttype\tleft\trght\tc_ab\tc_a\tc_b\tios_a\tios_b\ttime\tpairs\tsingle_bytes\twhole_words\tnew_unlocked");
+         }
+ 
+-        let mut i: usize = 0;
+         // Cache the best supermerge across iterations. Since regular merge
+         // replays don't change the supermerge heap (all tokens pre-unlocked),
+         // we can reuse the cached result instead of re-peeking each time.
+         let mut cached_super: Option<(Option<(Vec<u8>, Vec<u8>)>, i64)> = None;
+ 
++        if i >= vocab_size as usize {
++            println!("Resume model already has {} requested supermerges", vocab_size);
++            return Ok(());
++        }
++
+         loop {
+             let print_row = progress_interval > 0 && i % progress_interval == 0;
+ 
+@@ -2054,7 +2151,12 @@ impl BaseBpeTrainer {
+             {
+                 let checkpoint_start = Instant::now();
+                 let checkpoint_prefix = format!("{}_{}", outprefix, vocab_len);
+-                self.save(&checkpoint_prefix)?;
++                let partial_prefix = format!("{}.part", checkpoint_prefix);
++                self.save(&partial_prefix)?;
++                std::fs::rename(
++                    format!("{}.model", partial_prefix),
++                    format!("{}.model", checkpoint_prefix),
++                )?;
+                 total_checkpoint += checkpoint_start.elapsed().as_secs_f64();
+ 
+                 if verbose {
+@@ -2256,6 +2358,7 @@ impl BoundlessBpeTrainer {
+             greedy_split,
+             min_count,
+             max_ngram_len,
++            None,
+         )
+     }
+ 
+@@ -2291,6 +2394,7 @@ impl SuperBpeTrainer {
+         greedy_split: bool,
+         min_count: i64,
+         max_ngram_len: usize,
++        resume_model_file: Option<&str>,
+     ) -> TokenizerResult<()> {
+         assert!(vocab_size >= 1);
+ 
+@@ -2317,6 +2421,7 @@ impl SuperBpeTrainer {
+             greedy_split,
+             min_count,
+             max_ngram_len,
++            resume_model_file,
+         )
+     }
+ 

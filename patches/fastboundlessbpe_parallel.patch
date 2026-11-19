@@ -1,0 +1,398 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index 048b364..fb7e413 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -59,6 +59,7 @@ dependencies = [
+  "fancy-regex",
+  "priority-queue",
+  "pyo3",
++ "rayon",
+  "serde",
+  "serde_json",
+ ]
+@@ -69,6 +70,37 @@ version = "1.0.3"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "2fd1289c04a9ea8cb22300a459a72a385d7c73d3259e2ed7dcb2af674838cfa9"
+ 
++[[package]]
++name = "crossbeam-deque"
++version = "0.8.8"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "622f3fc73690be383c7214310406f28a90e6edeadc3cea882f9d71e495b9711a"
++dependencies = [
++ "crossbeam-epoch",
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-epoch"
++version = "0.9.21"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "dc74980687109a3b14c72fd458107bf0baa1da1a1a805e178d15501ba9b86d9d"
++dependencies = [
++ "crossbeam-utils",
++]
++
++[[package]]
++name = "crossbeam-utils"
++version = "0.8.23"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "a31eee39dddec8330830986fcd7625edb5a24ec90ea038215273bbc3adb08ac6"
++
++[[package]]
++name = "either"
++version = "1.18.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "252afb9ae5eaa683babdc6a068b3f5726eb19e05070c731f9b2a23a7c3e8ed34"
++
+ [[package]]
+ name = "equivalent"
+ version = "1.0.2"
+@@ -296,6 +328,26 @@ version = "5.3.0"
+ source = "registry+https://github.com/rust-lang/crates.io-index"
+ checksum = "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f"
+ 
++[[package]]
++name = "rayon"
++version = "1.12.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "fb39b166781f92d482534ef4b4b1b2568f42613b53e5b6c160e24cfbfa30926d"
++dependencies = [
++ "either",
++ "rayon-core",
++]
++
++[[package]]
++name = "rayon-core"
++version = "1.13.0"
++source = "registry+https://github.com/rust-lang/crates.io-index"
++checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
++dependencies = [
++ "crossbeam-deque",
++ "crossbeam-utils",
++]
++
+ [[package]]
+ name = "redox_syscall"
+ version = "0.5.17"
+diff --git a/Cargo.toml b/Cargo.toml
+index e965950..1da9c2e 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -17,9 +17,9 @@ ahash = "0.8"
+ serde = { version = "1.0", features = ["derive"] }
+ serde_json = "1.0"
+ priority-queue = "2.1"
++rayon = "1.11"
+ 
+ [features]
+ default = ["python-bindings"]
+ python-bindings = ["pyo3"]
+ 
+-
+diff --git a/src/trainer.rs b/src/trainer.rs
+index 1d8a599..547fb4d 100644
+--- a/src/trainer.rs
++++ b/src/trainer.rs
+@@ -5,6 +5,7 @@ use std::fs::File;
+ 
+ use ahash::{AHashMap, AHashSet};
+ use priority_queue::PriorityQueue;
++use rayon::prelude::*;
+ 
+ use crate::byte_encoding::ByteEncoder;
+ use crate::error::{TokenizerError, TokenizerResult};
+@@ -125,6 +126,72 @@ pub struct BaseBpeTrainer {
+ }
+ 
+ impl BaseBpeTrainer {
++    fn tally_word_batch(
++        batch: &[String],
++        pretokenizer: &Pretokenizer,
++        tally: &mut AHashMap<String, i64>,
++    ) {
++        let batch_tally = batch
++            .par_iter()
++            .fold(AHashMap::new, |mut local, text| {
++                for chunk in pretokenizer.pretokenize(text) {
++                    *local.entry(chunk).or_insert(0) += 1;
++                }
++                local
++            })
++            .reduce(AHashMap::new, |mut left, right| {
++                for (chunk, count) in right {
++                    *left.entry(chunk).or_insert(0) += count;
++                }
++                left
++            });
++        for (chunk, count) in batch_tally {
++            *tally.entry(chunk).or_insert(0) += count;
++        }
++    }
++
++    fn tally_super_batch(
++        batch: &[String],
++        pretokenizer: &Pretokenizer,
++        eligible: &AHashSet<Vec<u8>>,
++        counts: &mut AHashMap<Vec<Vec<u8>>, i64>,
++    ) {
++        let batch_counts = batch
++            .par_iter()
++            .fold(AHashMap::new, |mut local, text| {
++                let document_bytes: Vec<Vec<u8>> = pretokenizer
++                    .pretokenize(text)
++                    .into_iter()
++                    .map(String::into_bytes)
++                    .collect();
++                let mut idx = 0;
++                while idx < document_bytes.len() {
++                    if !eligible.contains(&document_bytes[idx]) {
++                        idx += 1;
++                        continue;
++                    }
++                    let mut end = idx + 1;
++                    while end < document_bytes.len() && eligible.contains(&document_bytes[end]) {
++                        end += 1;
++                    }
++                    if end - idx >= 2 {
++                        *local.entry(document_bytes[idx..end].to_vec()).or_insert(0) += 1;
++                    }
++                    idx = end;
++                }
++                local
++            })
++            .reduce(AHashMap::new, |mut left, right| {
++                for (run, count) in right {
++                    *left.entry(run).or_insert(0) += count;
++                }
++                left
++            });
++        for (run, count) in batch_counts {
++            *counts.entry(run).or_insert(0) += count;
++        }
++    }
++
+     pub fn new(pretokenizer: Option<Pretokenizer>) -> TokenizerResult<Self> {
+         let pretok = match pretokenizer {
+             Some(p) => p,
+@@ -218,6 +285,7 @@ impl BaseBpeTrainer {
+         let mut chunk_tally: AHashMap<String, i64> = AHashMap::new();
+         let mut total_bytes: usize = 0;
+         let mut total_chars: usize = 0;
++        let mut batch: Vec<String> = Vec::with_capacity(2_048);
+ 
+         let f = File::open(filepath)
+             .map_err(|e| TokenizerError::IoError(e))?;
+@@ -243,13 +311,15 @@ impl BaseBpeTrainer {
+                 .as_str()
+                 .ok_or_else(|| TokenizerError::ModelError("missing 'text' field".into()))?;
+ 
+-            for chunk in self.inf_data.pretokenizer.pretokenize(text) {
+-                *chunk_tally.entry(chunk).or_insert(0) += 1;
+-            }
+-
++            batch.push(text.to_owned());
+             total_chars += text.len();
+             total_bytes += text.len(); // approximate (UTF-8)
+ 
++            if batch.len() == 2_048 || total_bytes >= max_bytes {
++                Self::tally_word_batch(&batch, &self.inf_data.pretokenizer, &mut chunk_tally);
++                batch.clear();
++            }
++
+             if total_bytes >= max_bytes {
+                 if verbose {
+                     println!("at max_bytes {} {} {} {}", i, max_bytes, total_chars, total_bytes);
+@@ -257,6 +327,9 @@ impl BaseBpeTrainer {
+                 break;
+             }
+         }
++        if !batch.is_empty() {
++            Self::tally_word_batch(&batch, &self.inf_data.pretokenizer, &mut chunk_tally);
++        }
+ 
+         // Sort descending by count
+         let mut cnt_chk: Vec<(i64, Vec<u8>)> = chunk_tally
+@@ -334,6 +407,7 @@ impl BaseBpeTrainer {
+         let mut total_bytes: usize = 0;
+         let mut total_chars: usize = 0;
+         let mut counts: AHashMap<Vec<Vec<u8>>, i64> = AHashMap::new();
++        let mut batch: Vec<String> = Vec::with_capacity(2_048);
+ 
+         // Shortcut: precompute which pretokens (as raw bytes) are both
+         // single-token after merges (reachable) AND in possible_superwords.
+@@ -379,39 +453,20 @@ impl BaseBpeTrainer {
+                 .as_str()
+                 .ok_or_else(|| TokenizerError::ModelError("missing 'text' field".into()))?;
+ 
+-            let document_bytes: Vec<Vec<u8>> = self
+-                .inf_data
+-                .pretokenizer
+-                .pretokenize(text)
+-                .into_iter()
+-                .map(|chunk| chunk.into_bytes())
+-                .collect();
+-
+-            // Find runs of consecutive eligible pretokens directly,
+-            // skipping the full merge replay.
+-            let n = document_bytes.len();
+-            let mut idx = 0;
+-            while idx < n {
+-                if !supermerge_eligible.contains(&document_bytes[idx]) {
+-                    idx += 1;
+-                    continue;
+-                }
+-                // start of a run
+-                let mut end = idx + 1;
+-                while end < n && supermerge_eligible.contains(&document_bytes[end]) {
+-                    end += 1;
+-                }
+-                // need at least 2 consecutive eligible pretokens
+-                if end - idx >= 2 {
+-                    let superword_run: Vec<Vec<u8>> = document_bytes[idx..end].to_vec();
+-                    *counts.entry(superword_run).or_insert(0) += 1;
+-                }
+-                idx = end;
+-            }
+-
++            batch.push(text.to_owned());
+             total_chars += text.len();
+             total_bytes += text.len();
+ 
++            if batch.len() == 2_048 || total_bytes >= max_bytes {
++                Self::tally_super_batch(
++                    &batch,
++                    &self.inf_data.pretokenizer,
++                    &supermerge_eligible,
++                    &mut counts,
++                );
++                batch.clear();
++            }
++
+             if total_bytes >= max_bytes {
+                 if verbose {
+                     println!("at max_bytes {} {} {} {}", i, max_bytes, total_chars, total_bytes);
+@@ -419,6 +474,14 @@ impl BaseBpeTrainer {
+                 break;
+             }
+         }
++        if !batch.is_empty() {
++            Self::tally_super_batch(
++                &batch,
++                &self.inf_data.pretokenizer,
++                &supermerge_eligible,
++                &mut counts,
++            );
++        }
+ 
+         // Sort descending by count
+         let mut cnt_chk: Vec<(i64, Vec<Vec<u8>>)> = counts
+@@ -627,10 +690,24 @@ impl BaseBpeTrainer {
+         AHashMap<(Vec<u8>, Vec<u8>), i64>,
+         PriorityQueue<(Vec<u8>, Vec<u8>), PairPriority>,
+     ) {
+-        let mut pair_counts_dict: AHashMap<(Vec<u8>, Vec<u8>), i64> = AHashMap::new();
+-        for (tokens, &cnt) in text_chunks.iter().zip(text_counts.iter()) {
+-            Self::get_stats(tokens, &mut pair_counts_dict, cnt);
+-        }
++        let workers = rayon::current_num_threads().min(text_chunks.len()).max(1);
++        let partition_size = text_chunks.len().div_ceil(workers).max(1);
++        let pair_counts_dict = text_chunks
++            .par_chunks(partition_size)
++            .zip(text_counts.par_chunks(partition_size))
++            .map(|(chunks, counts)| {
++                let mut local = AHashMap::new();
++                for (tokens, &count) in chunks.iter().zip(counts.iter()) {
++                    Self::get_stats(tokens, &mut local, count);
++                }
++                local
++            })
++            .reduce(AHashMap::new, |mut left, right| {
++                for (pair, count) in right {
++                    *left.entry(pair).or_insert(0) += count;
++                }
++                left
++            });
+ 
+         let mut pair_counts_heap = PriorityQueue::new();
+         for (pair, &count) in &pair_counts_dict {
+@@ -954,8 +1031,77 @@ impl BaseBpeTrainer {
+             }
+         };
+ 
+-        // Fast path for is_super when first != second
+-        if first != second && self.inf_data.is_super {
++        // Common supermerges can touch thousands of independent runs. Count and
++        // rewrite each run in parallel, then update shared indexes serially.
++        if first != second
++            && self.inf_data.is_super
++            && candidates.len() >= 512
++            && rayon::current_num_threads() > 1
++        {
++            for candidate_batch in candidates.chunks(4_096) {
++                let (updates, deltas) = candidate_batch
++                    .par_iter()
++                    .fold(
++                        || (Vec::new(), AHashMap::new()),
++                        |(mut updates, mut deltas), &chunk_idx| {
++                            let tokens = &text_chunks[chunk_idx];
++                            let cnt = text_counts[chunk_idx];
++                            let merge_cnt_before = self.get_stats_faster(
++                                first, second, tokens, &mut deltas, cnt,
++                            );
++                            if merge_cnt_before > 0 {
++                                let (newtokens, merge_cnt) =
++                                    Tokenizer::merge(tokens, (first, second));
++                                assert_eq!(merge_cnt_before, merge_cnt);
++                                updates.push((chunk_idx, newtokens, merge_cnt * cnt, tokens.len()));
++                            }
++                            (updates, deltas)
++                        },
++                    )
++                    .reduce(
++                        || (Vec::new(), AHashMap::new()),
++                        |(mut left_updates, mut left_deltas), (right_updates, right_deltas)| {
++                            left_updates.extend(right_updates);
++                            for (pair, delta) in right_deltas {
++                                *left_deltas.entry(pair).or_insert(0) += delta;
++                            }
++                            (left_updates, left_deltas)
++                        },
++                    );
++                for (pair, delta) in deltas {
++                    *overall_change.entry(pair).or_insert(0) += delta;
++                }
++                for (chunk_idx, newtokens, merged_count, before_len) in updates {
++                    text_chunks[chunk_idx] = newtokens;
++                    total_merge_cnt += merged_count;
++                    let tokens = &text_chunks[chunk_idx];
++                    if tokens.len() == 1 && before_len > 1 {
++                        whole_word_increase += text_counts[chunk_idx];
++                        new_unlocked = Some(combined.clone());
++                    }
++                    if !tokens.contains(first) {
++                        if let Some(set) = self.token_locations.get_mut(first) {
++                            set.remove(&chunk_idx);
++                            if set.is_empty() {
++                                self.token_locations.remove(first);
++                            }
++                        }
++                    }
++                    if !tokens.contains(second) {
++                        if let Some(set) = self.token_locations.get_mut(second) {
++                            set.remove(&chunk_idx);
++                            if set.is_empty() {
++                                self.token_locations.remove(second);
++                            }
++                        }
++                    }
++                    self.token_locations
++                        .entry(combined.clone())
++                        .or_default()
++                        .insert(chunk_idx);
++                }
++            }
++        } else if first != second && self.inf_data.is_super {
+             for chunk_idx in &candidates {
+                 let tokens = &text_chunks[*chunk_idx];
+                 let cnt = text_counts[*chunk_idx];
