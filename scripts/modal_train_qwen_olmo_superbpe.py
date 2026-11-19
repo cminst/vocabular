@@ -27,7 +27,9 @@ TRAINING_BYTES = 10_000_000_000
 FASTBOUNDLESSBPE_REVISION = "c2dce3131093aa4c7fc595c91b15a861dea3094c"
 PARALLEL_PATCH = Path("patches/fastboundlessbpe_parallel.patch")
 RESUME_PATCH = Path("patches/fastboundlessbpe_resume.patch")
-BUILD_FINGERPRINT = sha256(PARALLEL_PATCH.read_bytes() + RESUME_PATCH.read_bytes()).hexdigest()
+BUILD_FINGERPRINT = os.getenv("FASTBOUNDLESSBPE_BUILD_FINGERPRINT") or sha256(
+    PARALLEL_PATCH.read_bytes() + RESUME_PATCH.read_bytes()
+).hexdigest()
 
 app = modal.App("vocabular-qwen-olmo-superbpe")
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
