@@ -91,7 +91,7 @@ index e965950..1da9c2e 100644
  
 -
 diff --git a/src/trainer.rs b/src/trainer.rs
-index 1d8a599..547fb4d 100644
+index 1d8a599..e17aa72 100644
 --- a/src/trainer.rs
 +++ b/src/trainer.rs
 @@ -5,6 +5,7 @@ use std::fs::File;
@@ -287,36 +287,7 @@ index 1d8a599..547fb4d 100644
  
          // Sort descending by count
          let mut cnt_chk: Vec<(i64, Vec<Vec<u8>>)> = counts
-@@ -627,10 +690,24 @@ impl BaseBpeTrainer {
-         AHashMap<(Vec<u8>, Vec<u8>), i64>,
-         PriorityQueue<(Vec<u8>, Vec<u8>), PairPriority>,
-     ) {
--        let mut pair_counts_dict: AHashMap<(Vec<u8>, Vec<u8>), i64> = AHashMap::new();
--        for (tokens, &cnt) in text_chunks.iter().zip(text_counts.iter()) {
--            Self::get_stats(tokens, &mut pair_counts_dict, cnt);
--        }
-+        let workers = rayon::current_num_threads().min(text_chunks.len()).max(1);
-+        let partition_size = text_chunks.len().div_ceil(workers).max(1);
-+        let pair_counts_dict = text_chunks
-+            .par_chunks(partition_size)
-+            .zip(text_counts.par_chunks(partition_size))
-+            .map(|(chunks, counts)| {
-+                let mut local = AHashMap::new();
-+                for (tokens, &count) in chunks.iter().zip(counts.iter()) {
-+                    Self::get_stats(tokens, &mut local, count);
-+                }
-+                local
-+            })
-+            .reduce(AHashMap::new, |mut left, right| {
-+                for (pair, count) in right {
-+                    *left.entry(pair).or_insert(0) += count;
-+                }
-+                left
-+            });
- 
-         let mut pair_counts_heap = PriorityQueue::new();
-         for (pair, &count) in &pair_counts_dict {
-@@ -954,8 +1031,77 @@ impl BaseBpeTrainer {
+@@ -954,8 +1017,77 @@ impl BaseBpeTrainer {
              }
          };
  
